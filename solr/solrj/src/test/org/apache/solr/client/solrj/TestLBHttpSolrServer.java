@@ -17,7 +17,15 @@
 
 package org.apache.solr.client.solrj;
 
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
 import junit.framework.Assert;
+
 import org.apache.commons.io.FileUtils;
 import org.apache.http.impl.client.DefaultHttpClient;
 import org.apache.http.impl.conn.tsccm.ThreadSafeClientConnManager;
@@ -32,13 +40,6 @@ import org.apache.solr.common.SolrInputDocument;
 import org.apache.solr.util.AbstractSolrTestCase;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
-
-import java.io.File;
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
 
 /**
  * Test for LBHttpSolrServer
@@ -101,6 +102,122 @@ public class TestLBHttpSolrServer extends LuceneTestCase {
       aSolr.tearDown();
     }
     super.tearDown();
+  }
+
+  public void testGetServer() throws Exception {
+    final String[] s = new String[solr.length];
+    for (int i = 0; i < solr.length; i++) {
+      s[i] = solr[i].getUrl();
+    }
+    final LBHttpSolrServer lbHttpSolrServer = new LBHttpSolrServer(httpClient, s);
+    final SolrServer server1 = lbHttpSolrServer.getSolrServer();
+    assertNotNull(server1);
+
+    // check that subsequent requests return a different server
+    final SolrServer server2 = lbHttpSolrServer.getSolrServer();
+    assertNotNull(server2);
+    assertNotSame(server1, server2);
+  }
+
+  public void testRequestPreferredServerWithServerAlive() throws Exception {
+    String[] s = new String[solr.length];
+    for (int i = 0; i < solr.length; i++) {
+      s[i] = solr[i].getUrl();
+    }
+    LBHttpSolrServer lbHttpSolrServer = new LBHttpSolrServer(httpClient, s);
+    lbHttpSolrServer.setAliveCheckInterval(500);
+    SolrServer server = lbHttpSolrServer.getSolrServer();
+    QueryResponse resp = lbHttpSolrServer.query(new SolrQuery("*:*"), server);
+    assertEquals(10, resp.getResults().getNumFound());
+    assertEquals(findSolrInstance(server).name, resp.getResults().get(0).getFieldValue("name").toString());
+  }
+
+  public void testRequestPreferredServerChecksAliveServersIfServerDead() throws Exception {
+    String[] s = new String[solr.length];
+    for (int i = 0; i < solr.length; i++) {
+      s[i] = solr[i].getUrl();
+    }
+    LBHttpSolrServer lbHttpSolrServer = new LBHttpSolrServer(httpClient, s);
+    lbHttpSolrServer.setAliveCheckInterval(500);
+
+    SolrServer server = lbHttpSolrServer.getSolrServer();
+
+    int idx = indexOf(server);
+    solr[idx].jetty.stop();
+    solr[idx].jetty = null;
+
+    QueryResponse resp = lbHttpSolrServer.query(new SolrQuery("*:*"), server);
+    assertEquals(10, resp.getResults().getNumFound());
+    String name = resp.getResults().get(0).getFieldValue("name").toString();
+    assertFalse(name.equals("solr" + idx));
+  }
+
+  public void testRequestPreferredServerChecksZombieServersIfNoneAlive() throws Exception {
+    String[] s = new String[solr.length];
+    for (int i = 0; i < solr.length; i++) {
+      s[i] = solr[i].getUrl();
+    }
+    LBHttpSolrServer lbHttpSolrServer = new LBHttpSolrServer(httpClient, s);
+    lbHttpSolrServer.setAliveCheckInterval(500);
+
+    // stop all but the last server
+    for (int i = 0; i < solr.length - 1; i++) {
+      solr[i].jetty.stop();
+      solr[i].jetty = null;
+    }
+
+    // make requests so that servers are marked as dead
+    SolrQuery solrQuery = new SolrQuery("*:*");
+    QueryResponse resp = null;
+    for (int i = 0; i < solr.length; i++) {
+      resp = lbHttpSolrServer.query(solrQuery);
+      assertEquals(10, resp.getResults().getNumFound());
+      assertEquals("solr" + (solr.length - 1), resp.getResults().get(0).getFieldValue("name").toString());
+    }
+    assertEquals(1, lbHttpSolrServer.countAliveServers());
+    assertEquals(solr.length - 1, lbHttpSolrServer.countDeadServers());
+
+    // we should get the last server
+    SolrServer server = lbHttpSolrServer.getSolrServer();
+    assertEquals(solr.length - 1, indexOf(server));
+
+    // start one of the dead servers, so that once this is checked it can be used
+    solr[0].startJetty();
+    // and stop the server that was the last one alive before
+    solr[solr.length - 1].jetty.stop();
+    solr[solr.length - 1].jetty = null;
+
+    // Wait for the alive check to complete
+    Thread.sleep(1200);
+
+    // Now make the request, so that the dead server that's live again is checked
+    try {
+      resp = lbHttpSolrServer.query(solrQuery, server);
+    } catch(SolrServerException e) {
+      // try again after a pause in case the error is lack of time to start server
+      Thread.sleep(3000);
+      resp = lbHttpSolrServer.query(solrQuery, server);
+    }
+    assertEquals(10, resp.getResults().getNumFound());
+    assertEquals("solr0", resp.getResults().get(0).getFieldValue("name").toString());
+  }
+
+  private int indexOf(SolrServer server) {
+    for (int i = 0; i < solr.length; i++) {
+      if(solr[i].getUrl().equals(((HttpSolrServer)server).getBaseURL())) {
+        return i;
+      }
+    }
+    throw new IllegalArgumentException("No SolrInstance found for server " + server);
+  }
+
+  private SolrInstance findSolrInstance(SolrServer server) {
+    for (SolrInstance instance : solr) {
+      if(instance.getUrl().equals(((HttpSolrServer)server).getBaseURL())) {
+        return instance;
+      }
+    }
+    throw new IllegalArgumentException("No SolrInstance found for server " + server);
   }
 
   public void testSimple() throws Exception {

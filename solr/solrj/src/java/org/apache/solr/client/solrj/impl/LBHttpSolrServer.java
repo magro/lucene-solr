@@ -22,7 +22,9 @@ import org.apache.http.impl.client.DefaultHttpRequestRetryHandler;
 import org.apache.http.impl.conn.tsccm.ThreadSafeClientConnManager;
 import org.apache.http.params.CoreConnectionPNames;
 import org.apache.solr.client.solrj.*;
+import org.apache.solr.client.solrj.request.QueryRequest;
 import org.apache.solr.client.solrj.response.QueryResponse;
+import org.apache.solr.common.params.SolrParams;
 import org.apache.solr.common.util.NamedList;
 import org.apache.solr.common.SolrException;
 
@@ -176,6 +178,18 @@ public class LBHttpSolrServer extends SolrServer {
     }
   }
 
+  private static class RequestResult {
+    final HttpSolrServer server;
+    final NamedList<Object> response;
+    public RequestResult(HttpSolrServer server, NamedList<Object> response) {
+      this.server = server;
+      this.response = response;
+    }
+    public QueryResponse toQueryResponse() {
+      return new QueryResponse(response, server);
+    }
+  }
+
   public LBHttpSolrServer(String... solrServerUrls) throws MalformedURLException {
     this(getDefaultClient(), solrServerUrls);
   }
@@ -204,6 +218,20 @@ public class LBHttpSolrServer extends SolrServer {
     updateAliveList();
   }
 
+  /**
+   * The number of alive servers.
+   */
+  public int countAliveServers() {
+    return aliveServerList.length;
+  }
+
+  /**
+   * The number of dead servers.
+   */
+  public int countDeadServers() {
+    return zombieServers.size();
+  }
+
   public static String normalize(String server) {
     if (server.endsWith("/"))
       server = server.substring(0, server.length() - 1);
@@ -213,8 +241,6 @@ public class LBHttpSolrServer extends SolrServer {
   protected HttpSolrServer makeServer(String server) throws MalformedURLException {
     return new HttpSolrServer(server, httpClient, binaryParser);
   }
-
-
 
   /**
    * Tries to query a live server from the list provided in Req. Servers in the dead pool are skipped.
@@ -407,6 +433,119 @@ public class LBHttpSolrServer extends SolrServer {
   }
 
   /**
+   * Tries to get a live server. If no live server is available servers in the dead pool are checked
+   * for aliveness and the first that's alive again is returned.
+   *
+   * If no live servers are found a SolrServerException is thrown.
+   *
+   * @return a SolrServer that's regarded to be alive
+   *
+   * @throws SolrServerException
+   */
+  public SolrServer getSolrServer() throws SolrServerException {
+    final int count = counter.incrementAndGet();
+    final int length = aliveServerList.length;
+    if(length > 0) {
+      return aliveServerList[count % length].solrServer;
+    }
+
+    for (ServerWrapper zombieServer : zombieServers.values()) {
+      final boolean alive = checkAZombieServer(zombieServer);
+      if(alive) {
+        return zombieServer.solrServer;
+      }
+    }
+
+    throw new SolrServerException("No live SolrServers available to handle this request");
+  }
+
+  /**
+   * Tries to query the specified preferred server. If the request failed due to IOException
+   * then the server is moved to dead pool and the request is retried on another live server.
+   * After live servers are exhausted, any servers previously marked as dead will be tried before
+   * failing the request.
+   *
+   * If no live servers are found a SolrServerException is thrown.
+   *
+   * @param params  an object holding all key/value parameters to send along the request
+   * @param preferredServer the preferred server to query.
+   *
+   * @return response
+   *
+   * @throws SolrServerException
+   */
+  public QueryResponse query(final SolrParams params, final SolrServer preferredServer) throws SolrServerException {
+    try {
+      long startTime = System.currentTimeMillis();
+      QueryResponse res = request(new QueryRequest(params), preferredServer);
+      res.setElapsedTime(System.currentTimeMillis() - startTime);
+      return res;
+    } catch (SolrServerException e){
+      throw e;
+    } catch (SolrException s){
+      throw s;
+    } catch (Exception e) {
+      throw new SolrServerException("Error executing query", e);
+    }
+  }
+
+  /**
+   * Tries to query the specified preferred server. If the request failed due to IOException
+   * then the server is moved to dead pool and the request is retried on another live server.
+   * After live servers are exhausted, any servers previously marked as dead will be tried before
+   * failing the request.
+   *
+   * If no live servers are found a SolrServerException is thrown.
+   *
+   * @param request the SolrRequest.
+   * @param preferredServer the preferred server to query.
+   *
+   * @return response that does not have set the elapsed time
+   *
+   * @throws SolrServerException
+   * @throws IOException
+   */
+  private QueryResponse request(final SolrRequest request, final SolrServer preferredServer)
+          throws SolrServerException, IOException {
+
+    final ServerWrapper wrapper = findAliveWrapper(preferredServer);
+
+    // If we did not find a wrapper in the alive list we just do the request
+    if(wrapper == null) {
+      return requestWithServer(request).toQueryResponse();
+    }
+
+    wrapper.lastUsed = System.currentTimeMillis();
+    try {
+      return new QueryResponse(wrapper.solrServer.request(request), wrapper.solrServer);
+    } catch (SolrException e) {
+      // Server is alive but the request was malformed or invalid
+      throw e;
+    } catch (SolrServerException e) {
+      if (e.getRootCause() instanceof IOException) {
+        moveAliveToDead(wrapper);
+        return requestWithServer(request).toQueryResponse();
+      } else {
+        throw e;
+      }
+    } catch (Exception e) {
+      throw new SolrServerException(e);
+    }
+  }
+
+  private ServerWrapper findAliveWrapper(SolrServer server) {
+    for (ServerWrapper wrapper : aliveServerList) {
+      // Perform an identity check as we want to get back the wrapper
+      // that provided the given server. Alternatively, we could compare
+      // the baseUrl after cast to HttpSolrServer
+      if(wrapper.solrServer == server) {
+        return wrapper;
+      }
+    }
+    return null;
+  }
+
+  /**
    * Tries to query a live server. A SolrServerException is thrown if all servers are dead.
    * If the request failed due to IOException then the live server is moved to dead pool and the request is
    * retried on another live server.  After live servers are exhausted, any servers previously marked as dead
@@ -422,6 +561,11 @@ public class LBHttpSolrServer extends SolrServer {
   @Override
   public NamedList<Object> request(final SolrRequest request)
           throws SolrServerException, IOException {
+    return requestWithServer(request).response;
+  }
+
+  private RequestResult requestWithServer(final SolrRequest request)
+          throws SolrServerException, IOException {
     Exception ex = null;
     ServerWrapper[] serverList = aliveServerList;
     
@@ -434,7 +578,7 @@ public class LBHttpSolrServer extends SolrServer {
       wrapper.lastUsed = System.currentTimeMillis();
 
       try {
-        return wrapper.solrServer.request(request);
+        return new RequestResult(wrapper.solrServer, wrapper.solrServer.request(request));
       } catch (SolrException e) {
         // Server is alive but the request was malformed or invalid
         throw e;
@@ -461,7 +605,7 @@ public class LBHttpSolrServer extends SolrServer {
         // remove from zombie list *before* adding to alive to avoid a race that could lose a server
         zombieServers.remove(wrapper.getKey());
         addToAlive(wrapper);
-        return rsp;
+        return new RequestResult(wrapper.solrServer, rsp);
       } catch (SolrException e) {
         // Server is alive but the request was malformed or invalid
         throw e;
@@ -490,8 +634,9 @@ public class LBHttpSolrServer extends SolrServer {
    * aliveness once in 'x' millis where x is decided by the setAliveCheckinterval() or it is defaulted to 1 minute
    *
    * @param zombieServer a server in the dead pool
+   * @return <code>true</code> if the server is alive again, otherwise <code>false</code>.
    */
-  private void checkAZombieServer(ServerWrapper zombieServer) {
+  private boolean checkAZombieServer(ServerWrapper zombieServer) {
     long currTime = System.currentTimeMillis();
     try {
       zombieServer.lastChecked = currTime;
@@ -510,7 +655,9 @@ public class LBHttpSolrServer extends SolrServer {
         } else {
           // something else already moved the server from zombie to alive
         }
+        return true;
       }
+      return false;
     } catch (Exception e) {
       //Expected. The server is still down.
       zombieServer.failedPings++;
@@ -520,6 +667,7 @@ public class LBHttpSolrServer extends SolrServer {
       if (!zombieServer.standard && zombieServer.failedPings >= NONSTANDARD_PING_LIMIT) {
         zombieServers.remove(zombieServer.getKey());
       }
+      return false;
     }
   }
 
